@@ -3,6 +3,11 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from datetime import datetime, timedelta
 import anthropic
 
@@ -910,8 +915,7 @@ with st.sidebar:
             with st.spinner("Running full analysis…"):
                 csv_bytes = uploaded.read()
                 # Store raw market df for portfolio price lookups
-                import io as _io
-                raw = pd.read_csv(_io.BytesIO(csv_bytes), low_memory=False)
+                raw = pd.read_csv(io.BytesIO(csv_bytes), low_memory=False)
                 raw = raw[raw['symbol'] != 'symbol']
                 for _c in ['open','high','low','close','volume','avg','trade_value']:
                     raw[_c] = pd.to_numeric(raw[_c], errors='coerce')
@@ -1392,12 +1396,6 @@ with tab3:
             brvm_s = pd2['brvm_aligned']
 
             if len(port_s) > 1:
-                import matplotlib
-                matplotlib.use('Agg')
-                import matplotlib.pyplot as plt
-                import matplotlib.ticker as mticker
-                import io as _mio
-
                 BG_C="#0d1117"; CARD_C="#161b22"; GRN_C="#2ea043"
                 BLU_C="#58a6ff"; GRY_C="#8b949e"; WHT_C="#e6edf3"
 
@@ -1443,7 +1441,7 @@ with tab3:
                     mticker.FuncFormatter(lambda x,_: f"{x/1e6:.2f}M" if x>=1e6 else f"{x:,.0f}")
                 )
                 plt.tight_layout()
-                buf = _mio.BytesIO()
+                buf = io.BytesIO()
                 plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=BG_C)
                 buf.seek(0)
                 st.image(buf, use_container_width=True)
