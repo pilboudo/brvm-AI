@@ -171,6 +171,33 @@ def init_state():
 
 init_state()
 
+def parse_instructions_to_filters(instructions):
+    """Convert plain-text instructions to structured filters."""
+    filters = []
+    text_lower = " ".join([i['text'].lower() for i in instructions if i.get('active', True)])
+    sector_keywords = {
+        'agriculture': ['agriculture','agri','cocoa','rubber','farming'],
+        'finance': ['finance','bank','banking'],
+        'distribution': ['distribution'],
+        'industry': ['industry','industrial'],
+        'public': ['public','utilities'],
+    }
+    for sector, keywords in sector_keywords.items():
+        for kw in keywords:
+            if f'ignore {kw}' in text_lower or f'exclude {kw}' in text_lower or f'avoid {kw}' in text_lower:
+                filters.append({'type':'exclude_sector','value':sector})
+                break
+    return filters
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO HELPERS  —  Transaction-ledger based
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Transaction schema:
+#   id, date, type (BUY|SELL|DIVIDEND|DIV_REINVEST), ric, qty, price, cash_flow, notes
+#   cash_flow: negative = cash out (buy), positive = cash in (sell/div)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ANALYSIS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,97 +504,6 @@ Be specific with prices and numbers. Keep it under 400 words."""
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## 📈 BRVM AI Tool")
-    st.markdown("---")
-
-    # ── API Key ────────────────────────────────────────────────────────────
-    st.markdown("### 🔑 API Key")
-    api_key_input = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        value=st.session_state.get("api_key", ""),
-        placeholder="sk-ant-...",
-        help="Get your key at console.anthropic.com"
-    )
-    if api_key_input:
-        st.session_state.api_key = api_key_input
-        st.markdown('<span class="badge badge-green">✓ Key Set</span>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Data Upload ────────────────────────────────────────────────────────
-    st.markdown("### 📂 Upload Market Data")
-    uploaded = st.file_uploader(
-        "Upload BRVM CSV (weekly update)",
-        type=["csv"],
-        help="Columns: symbol, date, open, high, low, close, volume, ric, avg, trade_value, sector"
-    )
-
-    if uploaded:
-        if st.button("▶ Run Analysis", use_container_width=True):
-            with st.spinner("Running full analysis…"):
-                csv_bytes = uploaded.read()
-                # Store raw market df for portfolio price lookups
-                import io as _io
-                raw = pd.read_csv(_io.BytesIO(csv_bytes), low_memory=False)
-                raw = raw[raw['symbol'] != 'symbol']
-                for _c in ['open','high','low','close','volume','avg','trade_value']:
-                    raw[_c] = pd.to_numeric(raw[_c], errors='coerce')
-                raw['date'] = pd.to_datetime(raw['date'], errors='coerce')
-                raw = raw.dropna(subset=['date','close','symbol'])
-                raw = raw[raw['close'] > 0].sort_values(['symbol','date']).reset_index(drop=True)
-                st.session_state.raw_df = raw
-                instr_list = parse_instructions_to_filters(st.session_state.instructions)
-                scored = run_analysis(csv_bytes, json.dumps(instr_list))
-                st.session_state.scored = scored
-                st.session_state.last_upload = datetime.now().strftime("%d %b %Y %H:%M")
-                st.session_state.weekly_briefing = None
-                st.session_state.port_data_v2    = None
-                st.success(f"✅ Analysed {len(scored)} stocks")
-
-    if st.session_state.last_upload:
-        st.markdown(
-            f'<div style="font-size:0.78rem;color:#8b949e">Last run: {st.session_state.last_upload}</div>',
-            unsafe_allow_html=True
-        )
-
-    st.markdown("---")
-
-    # ── Quick Filters / Instructions ───────────────────────────────────────
-    st.markdown("### ⚙️ Quick Filters")
-    new_instr = st.text_input("Add instruction", placeholder="e.g. ignore agriculture")
-    if st.button("Add", key="add_instr") and new_instr.strip():
-        st.session_state.instructions.append({
-            "date":   datetime.now().strftime("%d %b"),
-            "text":   new_instr.strip(),
-            "active": True,
-        })
-        run_analysis.clear()
-        st.rerun()
-
-    if st.session_state.instructions:
-        for i, instr in enumerate(st.session_state.instructions):
-            cols = st.columns([0.75, 0.25])
-            with cols[0]:
-                st.markdown(
-                    f'<div style="font-size:0.82rem;color:#e6edf3">{instr["text"]}</div>',
-                    unsafe_allow_html=True
-                )
-            with cols[1]:
-                if st.button("✕", key=f"del_instr_{i}"):
-                    st.session_state.instructions.pop(i)
-                    run_analysis.clear()
-                    st.rerun()
-
-    st.markdown("---")
-    st.markdown(
-        '<div style="font-size:0.75rem;color:#8b949e;text-align:center">'
-        'Not financial advice.<br>Data: BRVM • Macro: BCEAO/WAEMU</div>',
-        unsafe_allow_html=True
-    )
-
-# ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def color_badge(text, color):
@@ -581,32 +517,6 @@ def metric_card(label, value, color="blue", sub=""):
       <div class="metric-val" style="color:{'#2ea043' if color=='green' else '#f85149' if color=='red' else '#58a6ff' if color=='blue' else '#e3b341'}">{value}</div>
       {sub_html}
     </div>"""
-
-def parse_instructions_to_filters(instructions):
-    """Convert plain-text instructions to structured filters."""
-    filters = []
-    text_lower = " ".join([i['text'].lower() for i in instructions if i.get('active', True)])
-    sector_keywords = {
-        'agriculture': ['agriculture','agri','cocoa','rubber','farming'],
-        'finance': ['finance','bank','banking'],
-        'distribution': ['distribution'],
-        'industry': ['industry','industrial'],
-        'public': ['public','utilities'],
-    }
-    for sector, keywords in sector_keywords.items():
-        for kw in keywords:
-            if f'ignore {kw}' in text_lower or f'exclude {kw}' in text_lower or f'avoid {kw}' in text_lower:
-                filters.append({'type':'exclude_sector','value':sector})
-                break
-    return filters
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PORTFOLIO HELPERS  —  Transaction-ledger based
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Transaction schema:
-#   id, date, type (BUY|SELL|DIVIDEND|DIV_REINVEST), ric, qty, price, cash_flow, notes
-#   cash_flow: negative = cash out (buy), positive = cash in (sell/div)
 
 def ledger_to_positions(transactions: list) -> pd.DataFrame:
     """Derive current open positions from transaction ledger."""
@@ -967,6 +877,96 @@ Be direct, specific with numbers. Under 500 words."""
         return response.content[0].text
     except Exception as e:
         return f"⚠️ Error: {str(e)}"
+
+with st.sidebar:
+    st.markdown("## 📈 BRVM AI Tool")
+    st.markdown("---")
+
+    # ── API Key ────────────────────────────────────────────────────────────
+    st.markdown("### 🔑 API Key")
+    api_key_input = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        value=st.session_state.get("api_key", ""),
+        placeholder="sk-ant-...",
+        help="Get your key at console.anthropic.com"
+    )
+    if api_key_input:
+        st.session_state.api_key = api_key_input
+        st.markdown('<span class="badge badge-green">✓ Key Set</span>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Data Upload ────────────────────────────────────────────────────────
+    st.markdown("### 📂 Upload Market Data")
+    uploaded = st.file_uploader(
+        "Upload BRVM CSV (weekly update)",
+        type=["csv"],
+        help="Columns: symbol, date, open, high, low, close, volume, ric, avg, trade_value, sector"
+    )
+
+    if uploaded:
+        if st.button("▶ Run Analysis", use_container_width=True):
+            with st.spinner("Running full analysis…"):
+                csv_bytes = uploaded.read()
+                # Store raw market df for portfolio price lookups
+                import io as _io
+                raw = pd.read_csv(_io.BytesIO(csv_bytes), low_memory=False)
+                raw = raw[raw['symbol'] != 'symbol']
+                for _c in ['open','high','low','close','volume','avg','trade_value']:
+                    raw[_c] = pd.to_numeric(raw[_c], errors='coerce')
+                raw['date'] = pd.to_datetime(raw['date'], errors='coerce')
+                raw = raw.dropna(subset=['date','close','symbol'])
+                raw = raw[raw['close'] > 0].sort_values(['symbol','date']).reset_index(drop=True)
+                st.session_state.raw_df = raw
+                instr_list = parse_instructions_to_filters(st.session_state.instructions)
+                scored = run_analysis(csv_bytes, json.dumps(instr_list))
+                st.session_state.scored = scored
+                st.session_state.last_upload = datetime.now().strftime("%d %b %Y %H:%M")
+                st.session_state.weekly_briefing = None
+                st.session_state.port_data_v2    = None
+                st.success(f"✅ Analysed {len(scored)} stocks")
+
+    if st.session_state.last_upload:
+        st.markdown(
+            f'<div style="font-size:0.78rem;color:#8b949e">Last run: {st.session_state.last_upload}</div>',
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+
+    # ── Quick Filters / Instructions ───────────────────────────────────────
+    st.markdown("### ⚙️ Quick Filters")
+    new_instr = st.text_input("Add instruction", placeholder="e.g. ignore agriculture")
+    if st.button("Add", key="add_instr") and new_instr.strip():
+        st.session_state.instructions.append({
+            "date":   datetime.now().strftime("%d %b"),
+            "text":   new_instr.strip(),
+            "active": True,
+        })
+        run_analysis.clear()
+        st.rerun()
+
+    if st.session_state.instructions:
+        for i, instr in enumerate(st.session_state.instructions):
+            cols = st.columns([0.75, 0.25])
+            with cols[0]:
+                st.markdown(
+                    f'<div style="font-size:0.82rem;color:#e6edf3">{instr["text"]}</div>',
+                    unsafe_allow_html=True
+                )
+            with cols[1]:
+                if st.button("✕", key=f"del_instr_{i}"):
+                    st.session_state.instructions.pop(i)
+                    run_analysis.clear()
+                    st.rerun()
+
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:0.75rem;color:#8b949e;text-align:center">'
+        'Not financial advice.<br>Data: BRVM • Macro: BCEAO/WAEMU</div>',
+        unsafe_allow_html=True
+    )
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Dashboard",
