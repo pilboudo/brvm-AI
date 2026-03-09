@@ -161,6 +161,9 @@ def init_state():
         "instructions": [],          # [{date, text, active}]
         "weekly_briefing": None,
         "active_tab": 0,
+        "transactions": [],          # ledger of all transactions
+        "portfolio_analysis": None,  # cached AI assessment text
+        "port_data_v2": None,        # computed portfolio analytics
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -505,84 +508,377 @@ def parse_instructions_to_filters(instructions):
     return filters
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
+# PORTFOLIO HELPERS  —  Transaction-ledger based
 # ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## 📈 BRVM AI Tool")
-    st.markdown("---")
 
-    # API Key
-    st.markdown("### 🔑 API Key")
-    api_key_input = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        value=st.session_state.get("api_key",""),
-        placeholder="sk-ant-...",
-        help="Get your key at console.anthropic.com"
-    )
-    if api_key_input:
-        st.session_state.api_key = api_key_input
-        st.markdown('<span class="badge badge-green">✓ Key Set</span>', unsafe_allow_html=True)
+# Transaction schema:
+#   id, date, type (BUY|SELL|DIVIDEND|DIV_REINVEST), ric, qty, price, cash_flow, notes
+#   cash_flow: negative = cash out (buy), positive = cash in (sell/div)
 
-    st.markdown("---")
+def ledger_to_positions(transactions: list) -> pd.DataFrame:
+    """Derive current open positions from transaction ledger."""
+    if not transactions:
+        return pd.DataFrame(columns=['ric','qty','avg_cost','total_cost','sector'])
 
-    # Data Upload
-    st.markdown("### 📂 Upload Data")
-    uploaded = st.file_uploader(
-        "Upload CSV (weekly update)",
-        type=["csv"],
-        help="Same format as your historical data: symbol, date, open, high, low, close, volume, ric, avg, trade_value, sector"
-    )
+    rows = []
+    for t in transactions:
+        if t['type'] in ('BUY', 'DIV_REINVEST'):
+            rows.append({'ric': t['ric'], 'qty': float(t['qty']),
+                         'cost': float(t['qty']) * float(t['price']),
+                         'sector': t.get('sector','')})
+        elif t['type'] == 'SELL':
+            rows.append({'ric': t['ric'], 'qty': -float(t['qty']),
+                         'cost': -float(t['qty']) * float(t['price']),
+                         'sector': t.get('sector','')})
 
-    if uploaded:
-        if st.button("▶ Run Analysis", use_container_width=True):
-            with st.spinner("Running full analysis…"):
-                csv_bytes = uploaded.read()
-                instr_list = parse_instructions_to_filters(st.session_state.instructions)
-                scored = run_analysis(csv_bytes, json.dumps(instr_list))
-                st.session_state.scored = scored
-                st.session_state.last_upload = datetime.now().strftime("%d %b %Y %H:%M")
-                st.session_state.weekly_briefing = None  # reset for new data
-                st.success(f"✅ Analysed {len(scored)} stocks")
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=['ric','qty','avg_cost','total_cost','sector'])
 
-    if st.session_state.last_upload:
-        st.markdown(f'<div style="font-size:0.78rem;color:#8b949e">Last run: {st.session_state.last_upload}</div>', unsafe_allow_html=True)
+    pos = df.groupby('ric').agg(
+        qty=('qty','sum'),
+        total_cost=('cost','sum'),
+        sector=('sector','last')
+    ).reset_index()
+    pos = pos[pos['qty'] > 0.001].copy()
+    pos['avg_cost'] = pos['total_cost'] / pos['qty']
+    return pos
 
-    st.markdown("---")
 
-    # Quick instructions
-    st.markdown("### ⚙️ Quick Filters")
-    new_instr = st.text_input("Add instruction", placeholder="e.g. ignore agriculture")
-    if st.button("Add", key="add_instr") and new_instr.strip():
-        st.session_state.instructions.append({
-            "date": datetime.now().strftime("%d %b"),
-            "text": new_instr.strip(),
-            "active": True
+def ledger_cash_balance(transactions: list) -> float:
+    """Sum all cash flows from the ledger."""
+    return sum(float(t.get('cash_flow', 0)) for t in transactions)
+
+
+def compute_portfolio_v2(transactions: list, df_market: pd.DataFrame,
+                         scored: pd.DataFrame) -> dict:
+    """Full portfolio analytics from transaction ledger."""
+    if not transactions or df_market is None:
+        return None
+
+    positions = ledger_to_positions(transactions)
+    if positions.empty:
+        return None
+
+    # ── BRVM Composite baseline ─────────────────────────────────────────────
+    all_dates   = df_market['date'].sort_values().unique()
+    earliest_tx = min(pd.to_datetime(t['date']) for t in transactions)
+    idx_data    = (df_market.groupby(['date','symbol'])['close']
+                   .last().unstack().ffill())
+    idx_slice   = idx_data[idx_data.index >= earliest_tx].dropna(how='all')
+    if len(idx_slice) > 1:
+        base          = idx_slice.iloc[0].replace(0, np.nan)
+        brvm_composite = (idx_slice / base * 100).mean(axis=1)
+    else:
+        brvm_composite = pd.Series(dtype=float)
+
+    # ── Per-position analytics ──────────────────────────────────────────────
+    results        = []
+    port_val_series = {}
+    total_cost_basis = 0
+    total_current_val = 0
+
+    for _, pos in positions.iterrows():
+        ric       = pos['ric'].upper().strip()
+        qty       = float(pos['qty'])
+        avg_cost  = float(pos['avg_cost'])
+        sector    = pos.get('sector', '')
+        cost_b    = qty * avg_cost
+
+        # Market data for this ticker
+        sym_rows = df_market[df_market['ric'].str.upper() == ric]
+        if sym_rows.empty:
+            sym_rows = df_market[df_market['symbol'].str.upper().str.startswith(ric)]
+
+        if sym_rows.empty:
+            current_price = avg_cost
+            price_hist    = pd.Series(dtype=float)
+        else:
+            sym_sorted    = sym_rows.sort_values('date')
+            current_price = sym_sorted.iloc[-1]['close']
+            price_hist    = sym_sorted.set_index('date')['close']
+
+        current_val   = qty * current_price
+        unrealised_pl = current_val - cost_b
+        unrealised_pct= unrealised_pl / cost_b if cost_b > 0 else 0
+
+        total_cost_basis  += cost_b
+        total_current_val += current_val
+
+        # Realised P&L from sells of this ticker
+        sell_txs = [t for t in transactions if t['ric'].upper()==ric and t['type']=='SELL']
+        realised_pl = sum(
+            (float(t['price']) - _avg_cost_at(transactions, ric, t['date'])) * float(t['qty'])
+            for t in sell_txs
+        )
+
+        # Dividends actually received (from ledger)
+        div_received = sum(
+            float(t.get('cash_flow',0))
+            for t in transactions
+            if t['ric'].upper()==ric and t['type']=='DIVIDEND'
+        )
+        div_reinvested = sum(
+            float(t['qty'])*float(t['price'])
+            for t in transactions
+            if t['ric'].upper()==ric and t['type']=='DIV_REINVEST'
+        )
+
+        # Upcoming dividends from DIVIDENDS dict
+        max_date    = df_market['date'].max()
+        upcoming_div= None
+        if ric in DIVIDENDS:
+            divs = pd.DataFrame(DIVIDENDS[ric], columns=['ex_date','dividend'])
+            divs['ex_date'] = pd.to_datetime(divs['ex_date'])
+            future = divs[divs['ex_date'] > max_date].sort_values('ex_date')
+            if not future.empty:
+                nxt = future.iloc[0]
+                upcoming_div = {
+                    'date':   nxt['ex_date'],
+                    'per_share': nxt['dividend'],
+                    'amount': nxt['dividend'] * qty,
+                }
+
+        total_return_xof = unrealised_pl + realised_pl + div_received
+        total_return_pct = total_return_xof / cost_b if cost_b > 0 else 0
+
+        # AI signal
+        ai_signal = "No data"; ai_score = None; composite = None
+        if scored is not None:
+            match = scored[scored['ric'].str.upper() == ric]
+            if not match.empty:
+                ai_signal = match.iloc[0]['entry_signal']
+                ai_score  = match.iloc[0]['ai_score']
+                composite = match.iloc[0]['composite']
+
+        # Recommendation
+        if unrealised_pct > 0.40 and (composite or 0) < 0.50:
+            rec, rec_col = "✂️ TRIM — strong gain, weakening signal", "orange"
+        elif unrealised_pct > 0.60:
+            rec, rec_col = "✂️ TRIM — take profit", "orange"
+        elif unrealised_pct < -0.25 and (composite or 0) > 0.55:
+            rec, rec_col = "➕ ADD — down sharply, model still bullish", "green"
+        elif unrealised_pct < -0.35:
+            rec, rec_col = "🔄 REVIEW — large loss, reassess thesis", "red"
+        elif (composite or 0) > 0.58:
+            rec, rec_col = "✅ HOLD & CONSIDER ADDING", "green"
+        else:
+            rec, rec_col = "🤝 HOLD", "blue"
+
+        # Price series for chart
+        if len(price_hist) > 0:
+            first_buy = min(
+                pd.to_datetime(t['date'])
+                for t in transactions
+                if t['ric'].upper()==ric and t['type'] in ('BUY','DIV_REINVEST')
+            )
+            ph = price_hist[price_hist.index >= first_buy]
+            # Build value series respecting partial sells
+            val_s = _build_value_series(transactions, ric, price_hist)
+            if val_s is not None:
+                port_val_series[ric] = val_s
+
+        results.append({
+            'ric': ric, 'sector': sector,
+            'qty': qty, 'avg_cost': avg_cost,
+            'current_price': current_price,
+            'cost_basis': cost_b,
+            'current_val': current_val,
+            'unrealised_pl': unrealised_pl,
+            'unrealised_pct': unrealised_pct,
+            'realised_pl': realised_pl,
+            'div_received': div_received,
+            'div_reinvested': div_reinvested,
+            'total_return_xof': total_return_xof,
+            'total_return_pct': total_return_pct,
+            'upcoming_div': upcoming_div,
+            'ai_signal': ai_signal,
+            'ai_score': ai_score,
+            'composite': composite,
+            'recommendation': rec,
+            'rec_color': rec_col,
         })
-        run_analysis.clear()
-        st.rerun()
 
-    if st.session_state.instructions:
-        for i, instr in enumerate(st.session_state.instructions):
-            cols = st.columns([0.75, 0.25])
-            with cols[0]:
-                st.markdown(f'<div style="font-size:0.82rem;color:#e6edf3">{instr["text"]}</div>',
-                            unsafe_allow_html=True)
-            with cols[1]:
-                if st.button("✕", key=f"del_instr_{i}"):
-                    st.session_state.instructions.pop(i)
-                    run_analysis.clear()
-                    st.rerun()
+    pos_df = pd.DataFrame(results)
 
-    st.markdown("---")
-    st.markdown('<div style="font-size:0.75rem;color:#8b949e;text-align:center">Not financial advice.<br>Data: BRVM • Macro: BCEAO/WAEMU</div>', unsafe_allow_html=True)
+    # ── Portfolio-level totals ───────────────────────────────────────────────
+    total_pl        = total_current_val - total_cost_basis
+    total_pl_pct    = total_pl / total_cost_basis if total_cost_basis > 0 else 0
+    total_divs      = pos_df['div_received'].sum()
+    total_realised  = pos_df['realised_pl'].sum()
+    total_return_abs= total_pl + total_divs + total_realised
+    total_return_pct= total_return_abs / total_cost_basis if total_cost_basis > 0 else 0
+    cash_balance    = ledger_cash_balance(transactions)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN CONTENT
-# ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # ── Portfolio daily value series ────────────────────────────────────────
+    if port_val_series:
+        port_series = (pd.concat(port_val_series.values(), axis=1)
+                       .sum(axis=1).sort_index())
+        port_series = port_series[port_series > 0]
+    else:
+        port_series = pd.Series(dtype=float)
+
+    # Align BRVM composite to portfolio start value
+    if len(brvm_composite) > 1 and len(port_series) > 1:
+        start_val     = port_series.iloc[0]
+        brvm_aligned  = brvm_composite / brvm_composite.iloc[0] * start_val
+    else:
+        brvm_aligned  = pd.Series(dtype=float)
+
+    # ── Sector allocation ───────────────────────────────────────────────────
+    sec_alloc     = pos_df.groupby('sector')['current_val'].sum()
+    sec_alloc_pct = (sec_alloc / total_current_val * 100).round(1) if total_current_val > 0 else sec_alloc
+
+    # ── Upcoming dividends (all positions) ──────────────────────────────────
+    upcoming_divs = sorted(
+        [{'ric': r['ric'], **r['upcoming_div']}
+         for _, r in pos_df.iterrows() if r['upcoming_div']],
+        key=lambda x: x['date']
+    )
+
+    return {
+        'positions':        pos_df,
+        'total_cost_basis': total_cost_basis,
+        'total_current_val':total_current_val,
+        'total_pl':         total_pl,
+        'total_pl_pct':     total_pl_pct,
+        'total_divs':       total_divs,
+        'total_realised':   total_realised,
+        'total_return_abs': total_return_abs,
+        'total_return_pct': total_return_pct,
+        'cash_balance':     cash_balance,
+        'port_series':      port_series,
+        'brvm_aligned':     brvm_aligned,
+        'sec_alloc_pct':    sec_alloc_pct,
+        'upcoming_divs':    upcoming_divs,
+        'transactions':     transactions,
+    }
+
+
+def _avg_cost_at(transactions: list, ric: str, before_date: str) -> float:
+    """Compute average cost of a position just before a given date."""
+    bd   = pd.to_datetime(before_date)
+    buys = [t for t in transactions
+            if t['ric'].upper()==ric.upper()
+            and t['type'] in ('BUY','DIV_REINVEST')
+            and pd.to_datetime(t['date']) < bd]
+    sells= [t for t in transactions
+            if t['ric'].upper()==ric.upper()
+            and t['type']=='SELL'
+            and pd.to_datetime(t['date']) < bd]
+    total_qty  = sum(float(t['qty']) for t in buys) - sum(float(t['qty']) for t in sells)
+    total_cost = sum(float(t['qty'])*float(t['price']) for t in buys)
+    return total_cost / total_qty if total_qty > 0 else 0
+
+
+def _build_value_series(transactions: list, ric: str,
+                        price_hist: pd.Series) -> pd.Series:
+    """Build daily portfolio value series for one ticker, respecting partial sells."""
+    buy_txs  = sorted(
+        [t for t in transactions
+         if t['ric'].upper()==ric.upper() and t['type'] in ('BUY','DIV_REINVEST')],
+        key=lambda x: x['date']
+    )
+    if not buy_txs:
+        return None
+
+    first_date = pd.to_datetime(buy_txs[0]['date'])
+    ph         = price_hist[price_hist.index >= first_date].copy()
+    if len(ph) < 2:
+        return None
+
+    # Build running qty series
+    qty_changes = {}
+    for t in transactions:
+        if t['ric'].upper() != ric.upper():
+            continue
+        d = pd.to_datetime(t['date'])
+        if t['type'] in ('BUY','DIV_REINVEST'):
+            qty_changes[d] = qty_changes.get(d, 0) + float(t['qty'])
+        elif t['type'] == 'SELL':
+            qty_changes[d] = qty_changes.get(d, 0) - float(t['qty'])
+
+    qty_series = pd.Series(qty_changes).sort_index().reindex(ph.index).fillna(0).cumsum().ffill()
+    qty_series = qty_series.clip(lower=0)
+    return (ph * qty_series).dropna()
+
+
+def generate_portfolio_ai_analysis(portfolio_data: dict) -> str:
+    """Ask Claude for a full portfolio assessment."""
+    client = get_ai_client()
+    if not client:
+        return "⚠️ Please enter your Anthropic API key in the sidebar."
+
+    pos = portfolio_data['positions']
+    txns = portfolio_data.get('transactions', [])
+
+    positions_text = "\n".join([
+        f"  {r['ric']} ({r['sector']}) | Qty: {r['qty']:.0f} | "
+        f"Avg cost: {r['avg_cost']:,.0f} | Current: {r['current_price']:,.0f} | "
+        f"Unrealised P&L: {r['unrealised_pct']:+.1%} | "
+        f"Realised P&L: {r['realised_pl']:+,.0f} XOF | "
+        f"Divs received: {r['div_received']:,.0f} XOF | "
+        f"Total return: {r['total_return_pct']:+.1%} | "
+        f"AI signal: {r['ai_signal']} | Composite: {r['composite'] if r['composite'] else 'N/A'}"
+        for _, r in pos.iterrows()
+    ])
+    sector_text = "\n".join(
+        f"  {s}: {v:.1f}%" for s, v in portfolio_data['sec_alloc_pct'].items()
+    )
+    recent_txns = sorted(txns, key=lambda x: x['date'], reverse=True)[:10]
+    txn_text = "\n".join(
+        f"  {t['date']} | {t['type']} | {t['ric']} | "
+        f"qty:{t['qty']} @ {float(t['price']):,.0f} XOF"
+        for t in recent_txns
+    )
+
+    prompt = f"""You are an expert BRVM investment analyst. Analyse this investor's portfolio and provide sharp, actionable advice.
+
+PORTFOLIO SUMMARY:
+  Cost basis:        {portfolio_data['total_cost_basis']:,.0f} XOF
+  Current value:     {portfolio_data['total_current_val']:,.0f} XOF
+  Unrealised P&L:    {portfolio_data['total_pl']:+,.0f} XOF ({portfolio_data['total_pl_pct']:+.1%})
+  Realised P&L:      {portfolio_data['total_realised']:+,.0f} XOF
+  Dividends earned:  {portfolio_data['total_divs']:,.0f} XOF
+  Total return:      {portfolio_data['total_return_abs']:+,.0f} XOF ({portfolio_data['total_return_pct']:+.1%})
+  Cash balance:      {portfolio_data['cash_balance']:,.0f} XOF
+
+OPEN POSITIONS:
+{positions_text}
+
+SECTOR ALLOCATION:
+{sector_text}
+
+RECENT TRANSACTIONS:
+{txn_text}
+
+MACRO (March 2026):
+  BCEAO rate 3.00% (easing) | WAEMU GDP 6.7% | Inflation -0.8%
+  BRVM YTD +6.9% | Cocoa -43.9% | Rubber -23.5%
+
+Provide:
+1. **Overall Assessment** — total return vs BRVM benchmark (+6.9% YTD), are they beating the market?
+2. **Position Advice** — for each open position: hold / add / trim / exit with specific reasoning
+3. **Risk Flags** — concentration, sector exposure, overextended positions
+4. **Dividend Outlook** — income quality, what to expect next
+5. **Top Action This Week** — the single most impactful move right now
+
+Be direct, specific with numbers. Under 500 words."""
+
+    try:
+        response = get_ai_client().messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1200,
+            messages=[{"role":"user","content":prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"⚠️ Error: {str(e)}"
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Dashboard",
     "🏆 Rankings",
+    "💼 My Portfolio",
     "💬 AI Assistant",
     "📓 Notes & Results",
     "📰 Weekly Briefing"
@@ -757,9 +1053,476 @@ with tab2:
             """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 3 — AI ASSISTANT
+# TAB 3 — PORTFOLIO
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
+    st.markdown("### 💼 My Portfolio")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 3 — PORTFOLIO  (transaction-ledger based)
+# ─────────────────────────────────────────────────────────────────────────────
+with tab3:
+    st.markdown("### 💼 My Portfolio")
+    st.markdown(
+        '<div style="color:#8b949e;font-size:0.88rem;margin-bottom:16px">'
+        'Full transaction ledger — buy, sell, dividends, reinvestments. '
+        'Positions and P&L are derived automatically.</div>',
+        unsafe_allow_html=True
+    )
+
+    scored_now = st.session_state.scored
+
+    # ── TOP BAR: Add Transaction + Upload ─────────────────────────────────
+    input_mode = st.radio("Add transactions via:", ["Manual entry", "Upload CSV"], horizontal=True)
+
+    if input_mode == "Upload CSV":
+        st.markdown("""<div class="note-box">
+          <strong>CSV columns:</strong> date, type, ric, qty, price, sector, notes<br>
+          <strong>type values:</strong> BUY · SELL · DIVIDEND · DIV_REINVEST<br>
+          <strong>Example:</strong><br>
+          <code>2024-06-01, BUY, SNTS, 10, 25000, public, Initial buy</code><br>
+          <code>2025-05-20, DIVIDEND, SNTS, 0, 1839, public, Annual dividend</code><br>
+          <code>2025-08-01, SELL, SNTS, 3, 28000, public, Partial trim</code>
+        </div>""", unsafe_allow_html=True)
+        txn_csv = st.file_uploader("Upload transactions CSV", type=["csv"], key="txn_csv")
+        if txn_csv and st.button("📥 Load Transactions", key="load_txn_csv"):
+            try:
+                tdf = pd.read_csv(txn_csv)
+                tdf.columns = [c.strip().lower() for c in tdf.columns]
+                new_txns = []
+                for i, row in tdf.iterrows():
+                    txn_type = str(row.get('type','')).strip().upper()
+                    ric_val  = str(row.get('ric','')).strip().upper()
+                    qty_val  = float(row.get('qty', 0))
+                    price_val= float(row.get('price', 0))
+                    # cash_flow: BUY/DIV_REINVEST = negative (cash out), SELL/DIVIDEND = positive
+                    if txn_type in ('BUY','DIV_REINVEST'):
+                        cf = -(qty_val * price_val)
+                    elif txn_type == 'SELL':
+                        cf = qty_val * price_val
+                    elif txn_type == 'DIVIDEND':
+                        cf = price_val  # price = total dividend cash received
+                    else:
+                        cf = 0
+                    new_txns.append({
+                        'id':       i,
+                        'date':     str(row.get('date','')).strip(),
+                        'type':     txn_type,
+                        'ric':      ric_val,
+                        'qty':      qty_val,
+                        'price':    price_val,
+                        'cash_flow':cf,
+                        'sector':   str(row.get('sector','')).strip().lower(),
+                        'notes':    str(row.get('notes','')).strip(),
+                    })
+                st.session_state.transactions = new_txns
+                st.session_state.portfolio_analysis = None
+                st.session_state.port_data_v2 = None
+                st.success(f"✅ Loaded {len(new_txns)} transactions")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    else:  # Manual entry
+        with st.expander("➕ Add Transaction", expanded=len(st.session_state.get('transactions',[])) == 0):
+            tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+            with tc1:
+                t_type = st.selectbox("Type", ["BUY","SELL","DIVIDEND","DIV_REINVEST"], key="t_type")
+            with tc2:
+                t_ric  = st.text_input("Ticker (RIC)", placeholder="e.g. SNTS", key="t_ric").upper().strip()
+            with tc3:
+                t_qty  = st.number_input(
+                    "Qty / Shares" if t_type != "DIVIDEND" else "Qty (0 for cash div)",
+                    min_value=0.0, value=10.0, step=1.0, key="t_qty"
+                )
+            with tc4:
+                t_price= st.number_input(
+                    "Price per share (XOF)" if t_type != "DIVIDEND" else "Total dividend (XOF)",
+                    min_value=0.0, value=25000.0, step=100.0, key="t_price"
+                )
+            with tc5:
+                t_sector = st.selectbox("Sector", [
+                    "finance","agriculture","industry",
+                    "distribution","public","transportation","other"
+                ], key="t_sector")
+
+            tc6, tc7 = st.columns([3,1])
+            with tc6:
+                t_date  = st.date_input("Date", value=datetime.today(), key="t_date")
+                t_notes = st.text_input("Notes (optional)", placeholder="e.g. Q4 dividend received", key="t_notes")
+            with tc7:
+                # Show computed cash flow
+                if t_type in ('BUY','DIV_REINVEST'):
+                    cf_display = -(t_qty * t_price)
+                    cf_label   = "Cash out"
+                    cf_color   = "#f85149"
+                elif t_type == 'SELL':
+                    cf_display = t_qty * t_price
+                    cf_label   = "Cash in"
+                    cf_color   = "#2ea043"
+                elif t_type == 'DIVIDEND':
+                    cf_display = t_price
+                    cf_label   = "Cash in (div)"
+                    cf_color   = "#e3b341"
+                else:
+                    cf_display = 0; cf_label = ""; cf_color = "#8b949e"
+
+                st.markdown(f"""
+                <div style="text-align:center;padding:8px;background:#161b22;
+                     border-radius:6px;border:1px solid #21262d;margin-top:22px">
+                  <div style="font-size:0.72rem;color:#8b949e">{cf_label}</div>
+                  <div style="font-size:1.1rem;font-weight:800;color:{cf_color}">
+                    {cf_display:+,.0f} XOF
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+            if st.button("➕ Add Transaction", key="add_txn"):
+                if t_ric:
+                    if 'transactions' not in st.session_state:
+                        st.session_state.transactions = []
+                    cf = cf_display
+                    st.session_state.transactions.append({
+                        'id':       len(st.session_state.transactions),
+                        'date':     str(t_date),
+                        'type':     t_type,
+                        'ric':      t_ric,
+                        'qty':      t_qty,
+                        'price':    t_price,
+                        'cash_flow':cf,
+                        'sector':   t_sector,
+                        'notes':    t_notes,
+                    })
+                    st.session_state.portfolio_analysis = None
+                    st.session_state.port_data_v2       = None
+                    st.success(f"✅ Added {t_type} {t_ric}")
+                    st.rerun()
+                else:
+                    st.warning("Enter a ticker symbol.")
+
+    # ── TRANSACTION LEDGER ─────────────────────────────────────────────────
+    txns = st.session_state.get('transactions', [])
+
+    if txns:
+        # Run / clear buttons
+        rb1, rb2, rb3 = st.columns([0.3, 0.3, 0.4])
+        with rb1:
+            if st.button("📊 Analyse Portfolio", use_container_width=True, key="run_port_v2"):
+                raw_df = st.session_state.get("raw_df")
+                if raw_df is None:
+                    st.warning("⚠️ Upload your market data CSV in the sidebar first.")
+                else:
+                    with st.spinner("Computing…"):
+                        pd_ = compute_portfolio_v2(txns, raw_df, scored_now)
+                    st.session_state.port_data_v2 = pd_
+                    st.session_state.portfolio_analysis = None
+        with rb2:
+            if st.button("🗑 Clear All Transactions", use_container_width=True, key="clear_txns"):
+                st.session_state.transactions      = []
+                st.session_state.port_data_v2      = None
+                st.session_state.portfolio_analysis= None
+                st.rerun()
+
+        # ── LEDGER TABLE ───────────────────────────────────────────────────
+        with st.expander(f"📒 Transaction Ledger ({len(txns)} entries)", expanded=False):
+            type_colors = {
+                'BUY':'#58a6ff','SELL':'#f85149',
+                'DIVIDEND':'#e3b341','DIV_REINVEST':'#2ea043'
+            }
+            # Header
+            st.markdown("""
+            <div style="display:grid;grid-template-columns:0.8fr 1.2fr 0.8fr 0.7fr 1fr 1fr 1fr 1.5fr 0.5fr;
+                 gap:6px;padding:6px 10px;background:#21262d;border-radius:6px;
+                 font-size:0.72rem;color:#8b949e;font-weight:700;text-transform:uppercase;margin-bottom:4px">
+              <div>Date</div><div>Type</div><div>Ticker</div><div>Qty</div>
+              <div>Price</div><div>Cash Flow</div><div>Sector</div><div>Notes</div><div></div>
+            </div>""", unsafe_allow_html=True)
+
+            for i, t in enumerate(sorted(txns, key=lambda x: x['date'], reverse=True)):
+                tc = type_colors.get(t['type'], '#8b949e')
+                cf = float(t.get('cash_flow', 0))
+                cf_col = '#2ea043' if cf > 0 else '#f85149'
+                st.markdown(f"""
+                <div style="display:grid;grid-template-columns:0.8fr 1.2fr 0.8fr 0.7fr 1fr 1fr 1fr 1.5fr 0.5fr;
+                     gap:6px;padding:7px 10px;background:#161b22;border-radius:6px;
+                     border:1px solid #21262d;margin-bottom:3px;font-size:0.83rem;align-items:center">
+                  <div style="color:#8b949e">{t['date']}</div>
+                  <div><span style="color:{tc};font-weight:700">{t['type']}</span></div>
+                  <div style="font-weight:700;color:#e6edf3">{t['ric']}</div>
+                  <div>{float(t['qty']):,.0f}</div>
+                  <div>{float(t['price']):,.0f}</div>
+                  <div style="color:{cf_col};font-weight:700">{cf:+,.0f}</div>
+                  <div style="color:#8b949e">{t.get('sector','').capitalize()}</div>
+                  <div style="color:#8b949e;font-size:0.78rem">{t.get('notes','')}</div>
+                </div>""", unsafe_allow_html=True)
+                # Delete button per row
+                if st.button("✕", key=f"del_txn_{i}_{t['id']}"):
+                    orig_idx = next(
+                        (j for j,tx in enumerate(st.session_state.transactions)
+                         if tx['id']==t['id']), None
+                    )
+                    if orig_idx is not None:
+                        st.session_state.transactions.pop(orig_idx)
+                        st.session_state.port_data_v2 = None
+                        st.rerun()
+
+        # ── PORTFOLIO RESULTS ──────────────────────────────────────────────
+        pd2 = st.session_state.get("port_data_v2")
+        if pd2:
+            st.markdown("---")
+
+            # Summary metrics row
+            st.markdown('<div class="section-title">📈 Portfolio Summary</div>', unsafe_allow_html=True)
+            m1,m2,m3,m4,m5,m6 = st.columns(6)
+            tpl  = pd2['total_pl_pct']
+            trp  = pd2['total_return_pct']
+            bench= 0.0691  # BRVM YTD
+
+            with m1: st.markdown(metric_card("COST BASIS",    f"{pd2['total_cost_basis']/1e6:.2f}M XOF","blue"), unsafe_allow_html=True)
+            with m2: st.markdown(metric_card("MARKET VALUE",  f"{pd2['total_current_val']/1e6:.2f}M XOF","blue"), unsafe_allow_html=True)
+            with m3: st.markdown(metric_card("UNREALISED P&L",f"{tpl:+.1%}","green" if tpl>=0 else "red", f"{pd2['total_pl']:+,.0f} XOF"), unsafe_allow_html=True)
+            with m4: st.markdown(metric_card("REALISED P&L",  f"{pd2['total_realised']:+,.0f}","green" if pd2['total_realised']>=0 else "red","from closed positions"), unsafe_allow_html=True)
+            with m5: st.markdown(metric_card("DIVIDENDS",     f"{pd2['total_divs']/1e3:.1f}K XOF","gold","received"), unsafe_allow_html=True)
+            with m6:
+                alpha = trp - bench
+                st.markdown(metric_card(
+                    "TOTAL RETURN",
+                    f"{trp:+.1%}",
+                    "green" if trp >= bench else "red",
+                    f"α {alpha:+.1%} vs BRVM"
+                ), unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ── CHART: Portfolio vs BRVM ───────────────────────────────────
+            st.markdown('<div class="section-title">📊 Portfolio vs BRVM Composite</div>', unsafe_allow_html=True)
+            port_s = pd2['port_series']
+            brvm_s = pd2['brvm_aligned']
+
+            if len(port_s) > 1:
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                import matplotlib.ticker as mticker
+                import io as _mio
+
+                BG_C="#0d1117"; CARD_C="#161b22"; GRN_C="#2ea043"
+                BLU_C="#58a6ff"; GRY_C="#8b949e"; WHT_C="#e6edf3"
+
+                fig, ax = plt.subplots(figsize=(14,4.5), facecolor=BG_C)
+                ax.set_facecolor(CARD_C)
+
+                ax.plot(port_s.index, port_s.values, color=GRN_C, lw=2.2,
+                        label="My Portfolio", zorder=3)
+
+                brvm_reindexed = (brvm_s.reindex(port_s.index).ffill()
+                                  if len(brvm_s)>1 else pd.Series(index=port_s.index, dtype=float))
+
+                if len(brvm_reindexed.dropna()) > 1:
+                    ax.plot(brvm_reindexed.index, brvm_reindexed.values,
+                            color=BLU_C, lw=1.5, ls='--', alpha=0.8,
+                            label="BRVM Composite (rebased)")
+                    ax.fill_between(port_s.index, port_s.values, brvm_reindexed.values,
+                                    where=(port_s.values >= brvm_reindexed.values),
+                                    alpha=0.12, color=GRN_C, label="Outperformance")
+                    ax.fill_between(port_s.index, port_s.values, brvm_reindexed.values,
+                                    where=(port_s.values < brvm_reindexed.values),
+                                    alpha=0.12, color="#f85149", label="Underperformance")
+
+                # Mark sell events on chart
+                sell_txns = [t for t in txns if t['type']=='SELL']
+                for st_ in sell_txns:
+                    sd = pd.to_datetime(st_['date'])
+                    if sd in port_s.index:
+                        ax.axvline(sd, color="#f85149", lw=1, ls=':', alpha=0.6)
+
+                # Mark dividend events
+                div_txns = [t for t in txns if t['type'] in ('DIVIDEND','DIV_REINVEST')]
+                for dt_ in div_txns:
+                    dd = pd.to_datetime(dt_['date'])
+                    if dd in port_s.index:
+                        ax.axvline(dd, color="#e3b341", lw=1, ls=':', alpha=0.5)
+
+                ax.legend(fontsize=9, framealpha=0.2, labelcolor=WHT_C, loc='upper left')
+                ax.set_title("Portfolio Value vs BRVM Composite  |  🔴 dotted = sell  |  🟡 dotted = dividend",
+                             fontsize=11, color=WHT_C, pad=8)
+                ax.grid(alpha=0.12); ax.tick_params(colors=GRY_C)
+                ax.yaxis.set_major_formatter(
+                    mticker.FuncFormatter(lambda x,_: f"{x/1e6:.2f}M" if x>=1e6 else f"{x:,.0f}")
+                )
+                plt.tight_layout()
+                buf = _mio.BytesIO()
+                plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=BG_C)
+                buf.seek(0)
+                st.image(buf, use_container_width=True)
+                plt.close()
+            else:
+                st.info("Not enough price history to render chart.")
+
+            st.markdown("---")
+
+            # ── OPEN POSITIONS ─────────────────────────────────────────────
+            st.markdown('<div class="section-title">📋 Open Positions</div>', unsafe_allow_html=True)
+            pos_df = pd2['positions'].sort_values('unrealised_pct', ascending=False)
+
+            for _, r in pos_df.iterrows():
+                cc = ("green" if r['rec_color']=="green"
+                      else "red" if r['rec_color']=="red"
+                      else "orange" if r['rec_color']=="orange"
+                      else "blue")
+                pl_c  = '#2ea043' if r['unrealised_pl'] >= 0 else '#f85149'
+                ai_b  = color_badge(r['ai_signal'],
+                                    "green" if "BUY" in r['ai_signal']
+                                    else "red" if "PEAK" in r['ai_signal'] else "blue")
+                rec_b = color_badge(r['recommendation'],
+                                    r['rec_color'] if r['rec_color']!="orange" else "gold")
+
+                div_info = ""
+                if r['div_received'] > 0:
+                    div_info += f'<span style="color:#e3b341;margin-right:12px">÷ {r["div_received"]:,.0f} XOF received</span>'
+                if r['div_reinvested'] > 0:
+                    div_info += f'<span style="color:#2ea043;margin-right:12px">↺ {r["div_reinvested"]:,.0f} XOF reinvested</span>'
+                if r['upcoming_div']:
+                    ud = r['upcoming_div']
+                    div_info += (f'<span style="color:#58a6ff">📅 Next div: '
+                                 f'{ud["amount"]:,.0f} XOF on {ud["date"].strftime("%d %b %Y")}</span>')
+
+                st.markdown(f"""
+                <div class="card card-{cc}">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                    <div>
+                      <span class="stock-ticker">{r['ric']}</span>
+                      <span style="color:#8b949e;font-size:0.85rem;margin-left:8px">{str(r['sector']).capitalize()}</span>
+                    </div>
+                    <div>{ai_b} {rec_b}</div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:10px;margin-top:10px;font-size:0.84rem">
+                    <div><div class="metric-lbl">Qty held</div><b>{r['qty']:,.0f}</b></div>
+                    <div><div class="metric-lbl">Avg cost</div><b>{r['avg_cost']:,.0f}</b></div>
+                    <div><div class="metric-lbl">Current price</div><b>{r['current_price']:,.0f}</b></div>
+                    <div><div class="metric-lbl">Unrealised P&L</div>
+                      <b style="color:{pl_c}">{r['unrealised_pct']:+.1%}</b>
+                      <span style="font-size:0.77rem;color:#8b949e"> ({r['unrealised_pl']:+,.0f})</span>
+                    </div>
+                    <div><div class="metric-lbl">Realised P&L</div>
+                      <b style="color:{'#2ea043' if r['realised_pl']>=0 else '#f85149'}">{r['realised_pl']:+,.0f}</b>
+                    </div>
+                    <div><div class="metric-lbl">Total return</div>
+                      <b style="color:{'#2ea043' if r['total_return_pct']>=0 else '#f85149'}">{r['total_return_pct']:+.1%}</b>
+                    </div>
+                    <div><div class="metric-lbl">Market value</div><b>{r['current_val']:,.0f}</b></div>
+                  </div>
+                  <div style="margin-top:8px;font-size:0.82rem">{div_info}</div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ── SECTOR + BEST/WORST ────────────────────────────────────────
+            sec_col, bw_col = st.columns(2)
+
+            with sec_col:
+                st.markdown('<div class="section-title">🥧 Sector Allocation</div>', unsafe_allow_html=True)
+                sec_colors_map = {
+                    "finance":"#58a6ff","agriculture":"#2ea043","industry":"#e3b341",
+                    "distribution":"#ff7b2b","public":"#a371f7","transportation":"#f85149","other":"#8b949e"
+                }
+                for sector, pct in pd2['sec_alloc_pct'].sort_values(ascending=False).items():
+                    clr = sec_colors_map.get(sector.lower(),"#8b949e")
+                    st.markdown(f"""
+                    <div style="margin:5px 0">
+                      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+                        <span style="font-size:0.88rem;color:#e6edf3">{sector.capitalize()}</span>
+                        <span style="font-size:0.88rem;font-weight:700;color:{clr}">{pct:.1f}%</span>
+                      </div>
+                      <div style="background:#21262d;border-radius:4px;height:8px">
+                        <div style="background:{clr};width:{min(pct,100):.0f}%;height:8px;border-radius:4px"></div>
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+
+                # Risk flags
+                max_sec     = pd2['sec_alloc_pct'].idxmax() if len(pd2['sec_alloc_pct'])>0 else ""
+                max_sec_pct = pd2['sec_alloc_pct'].max() if len(pd2['sec_alloc_pct'])>0 else 0
+                agri_pct    = pd2['sec_alloc_pct'].get('agriculture',0)
+                n_pos       = len(pos_df)
+                flags       = []
+                if max_sec_pct > 50:
+                    flags.append(f'⚠️ {max_sec_pct:.0f}% in {max_sec} — concentrated')
+                if agri_pct > 20:
+                    flags.append(f'⚠️ {agri_pct:.0f}% in agriculture — cocoa/rubber risk')
+                if n_pos < 4:
+                    flags.append(f'⚠️ Only {n_pos} positions — consider diversifying')
+                if flags:
+                    st.markdown(f"""<div class="card card-orange" style="margin-top:10px">
+                      {'<br>'.join(flags)}</div>""", unsafe_allow_html=True)
+
+            with bw_col:
+                st.markdown('<div class="section-title">🏆 Best &amp; Worst Performers</div>', unsafe_allow_html=True)
+                best  = pos_df.nlargest(3,'total_return_pct')
+                worst = pos_df.nsmallest(3,'total_return_pct')
+                for _, r in best.iterrows():
+                    st.markdown(f"""<div class="card card-green" style="padding:10px 14px;margin-bottom:6px">
+                      <span style="font-weight:800">{r['ric']}</span>
+                      <span style="float:right;color:#2ea043;font-weight:800">{r['total_return_pct']:+.1%}</span>
+                      <div style="font-size:0.8rem;color:#8b949e">{r['avg_cost']:,.0f} → {r['current_price']:,.0f}
+                      {f" + {r['div_received']:,.0f} div" if r['div_received']>0 else ""}</div>
+                    </div>""", unsafe_allow_html=True)
+                st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+                for _, r in worst.iterrows():
+                    st.markdown(f"""<div class="card card-red" style="padding:10px 14px;margin-bottom:6px">
+                      <span style="font-weight:800">{r['ric']}</span>
+                      <span style="float:right;color:#f85149;font-weight:800">{r['total_return_pct']:+.1%}</span>
+                      <div style="font-size:0.8rem;color:#8b949e">{r['avg_cost']:,.0f} → {r['current_price']:,.0f}</div>
+                    </div>""", unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ── UPCOMING DIVIDENDS ─────────────────────────────────────────
+            if pd2['upcoming_divs']:
+                st.markdown('<div class="section-title">📅 Upcoming Dividends</div>', unsafe_allow_html=True)
+                ud_cols = st.columns(min(len(pd2['upcoming_divs']),4))
+                for col, div in zip(ud_cols, pd2['upcoming_divs']):
+                    with col:
+                        st.markdown(f"""
+                        <div class="card card-gold" style="text-align:center;padding:14px">
+                          <div style="font-weight:800;font-size:1.1rem;color:#58a6ff">{div['ric']}</div>
+                          <div style="font-size:1.3rem;font-weight:800;color:#e3b341">{div['amount']:,.0f} XOF</div>
+                          <div style="font-size:0.78rem;color:#8b949e">{div['per_share']:,.0f}/share</div>
+                          <div style="font-size:0.8rem;color:#8b949e">{div['date'].strftime('%d %b %Y')}</div>
+                        </div>""", unsafe_allow_html=True)
+                st.markdown("---")
+
+            # ── AI ASSESSMENT ──────────────────────────────────────────────
+            st.markdown('<div class="section-title">🤖 AI Portfolio Assessment</div>', unsafe_allow_html=True)
+            if st.session_state.portfolio_analysis:
+                st.markdown(f"""
+                <div class="card card-gold">
+                  <div style="font-size:0.8rem;color:#8b949e;margin-bottom:8px">🤖 AI Analysis</div>
+                  <div style="font-size:0.93rem;line-height:1.75;color:#e6edf3;white-space:pre-wrap">{st.session_state.portfolio_analysis}</div>
+                </div>""", unsafe_allow_html=True)
+                if st.button("🔄 Refresh", key="refresh_ai_v2"):
+                    with st.spinner("Analysing…"):
+                        st.session_state.portfolio_analysis = generate_portfolio_ai_analysis(pd2)
+                    st.rerun()
+            else:
+                if st.button("🤖 Generate AI Assessment", key="gen_ai_v2"):
+                    with st.spinner("Analysing your portfolio…"):
+                        st.session_state.portfolio_analysis = generate_portfolio_ai_analysis(pd2)
+                    st.rerun()
+
+    else:
+        st.markdown("""
+        <div class="card card-blue" style="text-align:center;padding:40px">
+          <div style="font-size:2rem">💼</div>
+          <div style="font-size:1.1rem;font-weight:700;margin:12px 0">No transactions yet</div>
+          <div style="color:#8b949e">Add transactions manually above or upload a CSV.<br>
+          Every buy, sell, dividend and reinvestment is recorded here.</div>
+        </div>""", unsafe_allow_html=True)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 4 — AI ASSISTANT
+# ─────────────────────────────────────────────────────────────────────────────
+with tab4:
     st.markdown("### 💬 AI Investment Assistant")
     st.markdown('<div style="color:#8b949e;font-size:0.88rem;margin-bottom:16px">Ask about specific stocks, get explanations of scores, give trading instructions, or explore macro themes.</div>', unsafe_allow_html=True)
 
@@ -819,9 +1582,9 @@ with tab3:
             st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 4 — NOTES & RESULTS
+# TAB 5 — NOTES & RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
-with tab4:
+with tab5:
     st.markdown("### 📓 Investment Notes & Results")
     st.markdown('<div style="color:#8b949e;font-size:0.88rem;margin-bottom:16px">Log your trades, results, and personal observations. The AI assistant reads these notes to give you better advice.</div>', unsafe_allow_html=True)
 
@@ -889,9 +1652,9 @@ with tab4:
         st.markdown('<div style="color:#8b949e;font-size:0.9rem">No notes yet. Log your first trade or observation above.</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 5 — WEEKLY BRIEFING
+# TAB 6 — WEEKLY BRIEFING
 # ─────────────────────────────────────────────────────────────────────────────
-with tab5:
+with tab6:
     st.markdown("### 📰 Weekly Investment Briefing")
     st.markdown('<div style="color:#8b949e;font-size:0.88rem;margin-bottom:16px">Generate a concise AI-written briefing summarising the top buys, sells, and market tone for the week.</div>', unsafe_allow_html=True)
 
