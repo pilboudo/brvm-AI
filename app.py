@@ -630,7 +630,8 @@ def run_analysis(csv_bytes: bytes, instructions_json: str) -> pd.DataFrame:
         )
         sector=str(row.get('sector','')).lower()
         macro_adj=SECTOR_MACRO.get(sector,0.0)
-        composite=(row['ai_score']*0.45+val_score*0.35+(0.5+macro_adj)*0.20)
+        sentiment_s=0.5  # default neutral; overridden post-hoc by recalculate_with_intel()
+        composite=(row['ai_score']*0.40+val_score*0.30+(0.5+macro_adj)*0.15+sentiment_s*0.15)
 
         # Entry signal
         if pct_from_hi52>-0.03 and rsi_v>72:
