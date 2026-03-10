@@ -154,6 +154,304 @@ SECTOR_MACRO = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MARKET INTELLIGENCE  —  Live web-search powered research
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Ticker → full company name for better search queries
+TICKER_NAMES = {
+    "SNTS": "Sonatel Sénégal BRVM",
+    "ONTBF": "ONATEL Burkina Faso BRVM",
+    "CBIBF": "Coris Bank International Burkina Faso BRVM",
+    "NSIAC": "NSIA Côte d'Ivoire assurance BRVM",
+    "TTLS": "Total Energies Sénégal BRVM",
+    "PALC": "Palm CI huile de palme BRVM",
+    "ORIV": "Orange Côte d'Ivoire BRVM",
+    "BIIC": "Banque Internationale pour l'Industrie et le Commerce BRVM",
+    "SGBC": "Société Générale Côte d'Ivoire BRVM",
+    "BOABF": "Bank of Africa Burkina Faso BRVM",
+    "SIBC": "Société Ivoirienne de Banque BRVM",
+    "ETIT": "Ecobank Transnational BRVM",
+    "FTSC": "Filtisac Côte d'Ivoire BRVM",
+    "STAC": "SAPH caoutchouc Côte d'Ivoire BRVM",
+    "BNBC": "Bernabé CI BRVM",
+    "CFAC": "CFAO Motors Côte d'Ivoire BRVM",
+    "SEMC": "Crown Siem Côte d'Ivoire BRVM",
+    "SICC": "SICOGI Côte d'Ivoire BRVM",
+    "UNLC": "Unilever Côte d'Ivoire BRVM",
+    "TTLC": "TotalEnergies Marketing Côte d'Ivoire BRVM",
+    "STBC": "Société des Transports Abidjanais BRVM",
+    "SCRC": "SUCRIVOIRE Côte d'Ivoire BRVM",
+}
+
+# Dividend history for income profile (3 years)
+DIVIDEND_HISTORY_3Y = {
+    "SNTS":  {"2022": 1556, "2023": 1667, "2024": 1750, "growth": "+6.3%", "yield_3y_avg": "6.1%", "payout_consistent": True},
+    "SGBC":  {"2022": 1100, "2023": 1200, "2024": 1300, "growth": "+8.7%", "yield_3y_avg": "4.2%", "payout_consistent": True},
+    "BOABF": {"2022": 600,  "2023": 650,  "2024": 700,  "growth": "+8.3%", "yield_3y_avg": "5.8%", "payout_consistent": True},
+    "CBIBF": {"2022": 650,  "2023": 790,  "2024": 850,  "growth": "+14.3%","yield_3y_avg": "6.2%", "payout_consistent": True},
+    "SIBC":  {"2022": 400,  "2023": 450,  "2024": 500,  "growth": "+11.8%","yield_3y_avg": "3.8%", "payout_consistent": True},
+    "PALC":  {"2022": 800,  "2023": 900,  "2024": None,  "growth": "+12.5%","yield_3y_avg": "8.1%", "payout_consistent": False},
+    "ETIT":  {"2022": 1.2,  "2023": 1.5,  "2024": 1.8,  "growth": "+22.5%","yield_3y_avg": "2.1%", "payout_consistent": True},
+    "TTLC":  {"2022": 350,  "2023": 420,  "2024": 500,  "growth": "+19.5%","yield_3y_avg": "4.5%", "payout_consistent": True},
+    "ONTBF": {"2022": 700,  "2023": 750,  "2024": None,  "growth": "+7.1%", "yield_3y_avg": "17.5%","payout_consistent": False},
+    "TTLS":  {"2022": 220,  "2023": 260,  "2024": 300,  "growth": "+16.9%","yield_3y_avg": "7.8%", "payout_consistent": True},
+    "UNLC":  {"2022": 1200, "2023": 1300, "2024": None,  "growth": "+8.3%", "yield_3y_avg": "5.2%", "payout_consistent": False},
+    "SCRC":  {"2022": 500,  "2023": 550,  "2024": None,  "growth": "+10.0%","yield_3y_avg": "3.9%", "payout_consistent": False},
+    "STBC":  {"2022": 350,  "2023": 400,  "2024": None,  "growth": "+14.3%","yield_3y_avg": "5.7%", "payout_consistent": False},
+}
+
+def fetch_market_intelligence(tickers: list, api_key: str, progress_callback=None) -> dict:
+    """
+    Use Claude with web_search tool to fetch live market intelligence
+    for a list of BRVM tickers. Returns dict: {ric -> intel_dict}
+    """
+    if not api_key:
+        return {}
+
+    client = anthropic.Anthropic(api_key=api_key)
+    results = {}
+
+    for i, ric in enumerate(tickers):
+        if progress_callback:
+            progress_callback(i, len(tickers), ric)
+
+        company_name = TICKER_NAMES.get(ric, f"{ric} BRVM")
+        div_hist = DIVIDEND_HISTORY_3Y.get(ric, {})
+        div_context = ""
+        if div_hist:
+            yrs = [f"{y}: {v} XOF" for y, v in div_hist.items() if y.isdigit() and v]
+            div_context = f"Known dividend history: {', '.join(yrs)}. Avg yield: {div_hist.get('yield_3y_avg','N/A')}."
+
+        prompt = f"""You are a BRVM (West African stock exchange) equity research analyst.
+Research this stock: {ric} ({company_name})
+
+{div_context}
+
+Search for the MOST RECENT information available on:
+1. brvm.org or sikafinance.com or richbourse.com — recent price action and volume trends for {ric}
+2. Recent news about {company_name} — earnings, dividends, corporate actions, management changes
+3. amf-uemoa.org — any recent regulatory filings, press releases, or sanctions for this company
+4. Macro/sector catalysts specifically relevant to this stock (WAEMU, BCEAO, sector trends)
+
+Return ONLY a JSON object (no markdown, no preamble) with these exact keys:
+{{
+  "sentiment": "bullish" | "neutral" | "bearish",
+  "sentiment_score": 0.0-1.0,
+  "volume_trend": "increasing" | "stable" | "decreasing" | "unknown",
+  "volume_comment": "one sentence about recent volume",
+  "catalyst_positive": ["list", "of", "upcoming", "positive", "catalysts"],
+  "catalyst_negative": ["list", "of", "risk", "factors"],
+  "dividend_comment": "one sentence about dividend outlook based on what you found",
+  "dividend_consistency": "consistent" | "irregular" | "suspended" | "unknown",
+  "analyst_note": "2-3 sentence summary of key finding from your research",
+  "data_sources": ["source1", "source2"],
+  "last_updated": "March 2026"
+}}"""
+
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=800,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}]
+            )
+            # Extract the final text block
+            text_blocks = [b for b in response.content if hasattr(b, 'text')]
+            if text_blocks:
+                raw = text_blocks[-1].text.strip()
+                raw = raw.replace("```json","").replace("```","").strip()
+                try:
+                    intel = json.loads(raw)
+                    intel['ric'] = ric
+                    results[ric] = intel
+                except json.JSONDecodeError:
+                    results[ric] = _default_intel(ric, "JSON parse error")
+            else:
+                results[ric] = _default_intel(ric, "No text response")
+        except Exception as e:
+            results[ric] = _default_intel(ric, str(e))
+
+    return results
+
+
+def _default_intel(ric: str, error: str = "") -> dict:
+    return {
+        "ric": ric, "sentiment": "neutral", "sentiment_score": 0.5,
+        "volume_trend": "unknown", "volume_comment": "No data available.",
+        "catalyst_positive": [], "catalyst_negative": [],
+        "dividend_comment": "No recent data found.",
+        "dividend_consistency": "unknown",
+        "analyst_note": f"Research unavailable. {error}",
+        "data_sources": [], "last_updated": "N/A"
+    }
+
+
+def generate_deep_dive(ric: str, scored_row: dict, intel: dict,
+                       portfolio_position: dict, api_key: str) -> str:
+    """Generate a comprehensive per-ticker equity research note."""
+    if not api_key:
+        return "⚠️ API key required."
+    client = anthropic.Anthropic(api_key=api_key)
+
+    pos_text = "Not currently held."
+    if portfolio_position:
+        p = portfolio_position
+        pos_text = (
+            f"HELD: {p.get('qty',0):.0f} shares @ avg cost {p.get('avg_cost',0):,.0f} XOF | "
+            f"Current P&L: {p.get('unrealised_pct',0):+.1%} | "
+            f"Dividends received: {p.get('div_received',0):,.0f} XOF"
+        )
+
+    div_hist = DIVIDEND_HISTORY_3Y.get(ric, {})
+    div_text = ""
+    if div_hist:
+        yrs = [f"{y}: {v} XOF" for y, v in div_hist.items() if y.isdigit() and v]
+        div_text = f"3Y dividends: {', '.join(yrs)} | Growth: {div_hist.get('growth','N/A')} | Consistency: {'Yes' if div_hist.get('payout_consistent') else 'Irregular'}"
+
+    prompt = f"""You are a senior BRVM equity research analyst writing a formal stock note.
+
+TICKER: {ric} ({TICKER_NAMES.get(ric, ric)})
+SECTOR: {scored_row.get('sector','N/A')}
+
+QUANTITATIVE DATA:
+- Price: {scored_row.get('last_price',0):,.0f} XOF
+- vs 52W High: {scored_row.get('pct_from_hi52',0):+.1%}
+- vs ATH: {scored_row.get('pct_from_ath',0):+.1%}
+- 1Y Return: {scored_row.get('ret_1y',0):+.1%}
+- RSI(14): {scored_row.get('rsi14',50):.0f}
+- MACD hist: {scored_row.get('macd_hist',0):+.1f}
+- Div yield: {scored_row.get('div_yield',0):.1%}
+- AI composite score: {scored_row.get('composite',0):.2f}/1.0
+- Entry signal: {scored_row.get('entry_signal','N/A')}
+
+LIVE INTELLIGENCE (from web research):
+- Market sentiment: {intel.get('sentiment','N/A')} (score: {intel.get('sentiment_score',0.5):.2f})
+- Volume trend: {intel.get('volume_trend','N/A')}
+- Volume comment: {intel.get('volume_comment','N/A')}
+- Positive catalysts: {', '.join(intel.get('catalyst_positive',[]) or ['None identified'])}
+- Risk factors: {', '.join(intel.get('catalyst_negative',[]) or ['None identified'])}
+- Dividend outlook: {intel.get('dividend_comment','N/A')}
+- Analyst note: {intel.get('analyst_note','N/A')}
+- Sources: {', '.join(intel.get('data_sources',[]) or ['N/A'])}
+
+INCOME PROFILE (3-year):
+{div_text if div_text else 'No dividend history available.'}
+
+PORTFOLIO INTEGRATION:
+{pos_text}
+
+MACRO (March 2026): BCEAO 3.00% (easing) | WAEMU GDP 6.7% | BRVM YTD +6.9%
+
+Write a structured research note with these sections:
+## Investment Thesis (2-3 sentences, buy/hold/sell recommendation)
+## Market Sentiment & Volume Analysis
+## Catalyst Watch (next 3-6 months)
+## Income Profile & Dividend Analysis
+## Portfolio Recommendation (specific action for this investor)
+## Key Risks
+## Price Target Indication (qualitative range vs current price)
+
+Be specific, data-driven, professional. Max 450 words."""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"⚠️ Error generating deep dive: {e}"
+
+
+def generate_rebalance_report(scored: pd.DataFrame, portfolio_data: dict,
+                               market_intel: dict, api_key: str) -> str:
+    """Generate a full portfolio rebalance recommendation integrating live intel."""
+    if not api_key:
+        return "⚠️ API key required."
+    client = anthropic.Anthropic(api_key=api_key)
+
+    if portfolio_data is None:
+        pos_text = "No portfolio data loaded."
+    else:
+        pos = portfolio_data['positions']
+        lines = []
+        for _, r in pos.iterrows():
+            intel = market_intel.get(r['ric'], {})
+            lines.append(
+                f"  {r['ric']} | Qty:{r['qty']:.0f} | AvgCost:{r['avg_cost']:,.0f} | "
+                f"CMP:{r['current_price']:,.0f} | P&L:{r['unrealised_pct']:+.1%} | "
+                f"Total return:{r['total_return_pct']:+.1%} | Divs:{r['div_received']:,.0f} XOF | "
+                f"AI signal:{r['ai_signal']} | Sentiment:{intel.get('sentiment','N/A')} | "
+                f"Catalysts:{'; '.join(intel.get('catalyst_positive',[])[:2] or ['none'])} | "
+                f"Risks:{'; '.join(intel.get('catalyst_negative',[])[:2] or ['none'])}"
+            )
+        pos_text = "\n".join(lines)
+        summary = (
+            f"Total value: {portfolio_data['total_current_val']:,.0f} XOF | "
+            f"Cost basis: {portfolio_data['total_cost_basis']:,.0f} XOF | "
+            f"Unrealised P&L: {portfolio_data['total_pl_pct']:+.1%} | "
+            f"Total return (incl divs): {portfolio_data['total_return_pct']:+.1%} | "
+            f"Cash balance: {portfolio_data['cash_balance']:,.0f} XOF"
+        )
+
+    # Top buy candidates with intel
+    top_buys = scored.head(10)
+    buy_lines = []
+    for _, r in top_buys.iterrows():
+        intel = market_intel.get(r['ric'], {})
+        buy_lines.append(
+            f"  #{r['rank']} {r['ric']} | Score:{r['composite']:.2f} | {r['entry_signal']} | "
+            f"Sentiment:{intel.get('sentiment','N/A')} | "
+            f"Catalysts:{'; '.join(intel.get('catalyst_positive',[])[:2] or ['none'])}"
+        )
+    buys_text = "\n".join(buy_lines)
+
+    prompt = f"""You are a senior BRVM portfolio strategist. Produce a comprehensive rebalance report.
+
+PORTFOLIO SUMMARY:
+{summary if portfolio_data else 'No portfolio loaded.'}
+
+CURRENT HOLDINGS (with live intelligence):
+{pos_text}
+
+TOP-RANKED OPPORTUNITIES (model + live intel):
+{buys_text}
+
+MACRO (March 2026): BCEAO rate 3.00% easing | WAEMU GDP 6.7% | BRVM YTD +6.9% | Cocoa -43.9% | Rubber -23.5%
+
+Produce a structured REBALANCE REPORT:
+
+## Executive Summary (3 sentences: overall portfolio health, market context, key action)
+
+## Holdings Review — Action per Position
+For each holding, give: HOLD / ADD / TRIM / EXIT with specific reasoning integrating P&L, AI signal, sentiment, and catalysts.
+
+## New Positions to Initiate
+Top 2-3 stocks from the opportunity list not currently held, with rationale and suggested entry sizing.
+
+## Income Optimisation
+Dividend calendar review — which positions to reinforce for income, any upcoming ex-dates to act before.
+
+## Risk & Concentration
+Flag any sector concentration, geopolitical exposure, or overleveraged positions.
+
+## Priority Action Plan (numbered, top 5 actions in order of urgency)
+
+Be direct, specific with prices and percentages. Professional tone. Max 600 words."""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"⚠️ Error: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════════════════════
 def init_state():
@@ -169,6 +467,10 @@ def init_state():
         "transactions": [],          # ledger of all transactions
         "portfolio_analysis": None,  # cached AI assessment text
         "port_data_v2": None,        # computed portfolio analytics
+        "market_intel": {},          # {ric -> intel_dict} from live web research
+        "deep_dive_cache": {},       # {ric -> research_text}
+        "rebalance_report": None,    # cached rebalance report
+        "intel_last_run": None,      # timestamp of last research run
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -357,13 +659,54 @@ def run_analysis(csv_bytes: bytes, instructions_json: str) -> pd.DataFrame:
             'vol_ratio':row.get('vol_ratio',1) or 1,
             'trade_val_ma20':row.get('trade_val_ma20',0) or 0,
             'ai_score':row['ai_score'],'val_score':val_score,
-            'macro_adj':macro_adj,'composite':composite,
+            'macro_adj':macro_adj,'sentiment_score':sentiment_s,'composite':composite,
             'entry_signal':entry_signal,'entry_color':entry_color,
         })
 
     scored=pd.DataFrame(rows).sort_values('composite',ascending=False).reset_index(drop=True)
     scored['rank']=range(1,len(scored)+1)
     return scored
+
+def recalculate_with_intel(scored: 'pd.DataFrame', market_intel: dict) -> 'pd.DataFrame':
+    """Re-score the scored dataframe incorporating live sentiment scores."""
+    if scored is None or not market_intel:
+        return scored
+    df = scored.copy()
+    for i, row in df.iterrows():
+        ric = row['ric']
+        intel = market_intel.get(ric, {})
+        sentiment_s = float(intel.get('sentiment_score', 0.5))
+        macro_adj = row['macro_adj']
+        # Updated composite: 40% AI + 30% entry + 15% macro + 15% sentiment
+        new_composite = (row['ai_score']*0.40 + row['val_score']*0.30 +
+                         (0.5+macro_adj)*0.15 + sentiment_s*0.15)
+        df.at[i, 'sentiment_score'] = sentiment_s
+        df.at[i, 'composite'] = new_composite
+        # Re-derive entry signal from new composite
+        pct_from_hi52 = row['pct_from_hi52']
+        rsi_v = row['rsi14']
+        if pct_from_hi52 > -0.03 and rsi_v > 72:
+            df.at[i, 'entry_signal'] = "⚠️ AT PEAK — WAIT"
+            df.at[i, 'entry_color'] = "red"
+        elif pct_from_hi52 > -0.05:
+            df.at[i, 'entry_signal'] = "⚠️ NEAR PEAK — WAIT"
+            df.at[i, 'entry_color'] = "orange"
+        elif new_composite > 0.60 and pct_from_hi52 < -0.15:
+            df.at[i, 'entry_signal'] = "🚀 STRONG BUY"
+            df.at[i, 'entry_color'] = "green"
+        elif new_composite > 0.52 and pct_from_hi52 < -0.08:
+            df.at[i, 'entry_signal'] = "✅ BUY ON DIPS"
+            df.at[i, 'entry_color'] = "green"
+        elif new_composite > 0.48:
+            df.at[i, 'entry_signal'] = "👀 WATCH"
+            df.at[i, 'entry_color'] = "blue"
+        else:
+            df.at[i, 'entry_signal'] = "📊 NEUTRAL"
+            df.at[i, 'entry_color'] = "grey"
+    df = df.sort_values('composite', ascending=False).reset_index(drop=True)
+    df['rank'] = range(1, len(df)+1)
+    return df
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AI ASSISTANT
@@ -972,13 +1315,14 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Dashboard",
     "🏆 Rankings",
     "💼 My Portfolio",
     "💬 AI Assistant",
     "📓 Notes & Results",
-    "📰 Weekly Briefing"
+    "📰 Weekly Briefing",
+    "🔍 Deep Research"
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1126,6 +1470,23 @@ with tab2:
             rsi_badge = color_badge(f"RSI {r['rsi14']:.0f}",
                                     "red" if r['rsi14']>70 else ("green" if r['rsi14']<35 else "blue"))
             signal_badge = color_badge(r['entry_signal'], entry_c if entry_c!="orange" else "gold")
+            # Sentiment badge if live intel available
+            intel_r = st.session_state.market_intel.get(r['ric'], {})
+            sent_str = intel_r.get('sentiment','') if intel_r else ''
+            sent_badge = ''
+            if sent_str == 'bullish':
+                sent_badge = color_badge('🟢 Bullish', 'green')
+            elif sent_str == 'bearish':
+                sent_badge = color_badge('🔴 Bearish', 'red')
+            elif sent_str == 'neutral':
+                sent_badge = color_badge('⚪ Neutral', 'blue')
+            catalyst_html = ''
+            if intel_r.get('catalyst_positive'):
+                cats = ' · '.join((intel_r['catalyst_positive'] or [])[:2])
+                catalyst_html = f'<div style="font-size:0.77rem;color:#2ea043;margin-top:4px">✅ {cats}</div>'
+            if intel_r.get('catalyst_negative'):
+                risks = ' · '.join((intel_r['catalyst_negative'] or [])[:2])
+                catalyst_html += f'<div style="font-size:0.77rem;color:#f85149;margin-top:2px">⚠️ {risks}</div>'
 
             st.markdown(f"""
             <div class="card card-{card_c}">
@@ -1135,7 +1496,7 @@ with tab2:
                   <span class="stock-ticker" style="margin-left:8px">{r['ric']}</span>
                   <span style="color:#8b949e;font-size:0.85rem;margin-left:8px">{str(r['sector']).capitalize()}</span>
                 </div>
-                <div>{signal_badge} {rsi_badge} {color_badge(f"Composite {r['composite']:.2f}", "gold")}</div>
+                <div>{signal_badge} {rsi_badge} {color_badge(f"Composite {r['composite']:.2f}", "gold")} {sent_badge}</div>
               </div>
               <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-top:10px;font-size:0.83rem">
                 <div><div class="metric-lbl">Price</div><b>{r['last_price']:,.0f}</b></div>
@@ -1146,6 +1507,7 @@ with tab2:
                 <div><div class="metric-lbl">1Y Return</div><b style="color:{'#2ea043' if r['ret_1y']>0 else '#f85149'}">{r['ret_1y']:+.1%}</b></div>
                 <div><div class="metric-lbl">Div Yield</div><b style="color:#e3b341">{r['div_yield']:.1%}</b></div>
               </div>
+              {catalyst_html}
             </div>
             """, unsafe_allow_html=True)
 
@@ -1776,3 +2138,342 @@ with tab6:
                 file_name=f"BRVM_briefing_{datetime.now().strftime('%Y%m%d')}.txt",
                 mime="text/plain"
             )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 7 — DEEP RESEARCH & REBALANCE
+# ─────────────────────────────────────────────────────────────────────────────
+with tab7:
+    st.markdown("### 🔍 Deep Research & Portfolio Rebalance")
+    st.markdown(
+        '<div style="color:#8b949e;font-size:0.88rem;margin-bottom:16px">'
+        'AI-powered live research from BRVM.org, Sikafinance, Richbourse, AMF-UEMOA. '
+        'Sentiment, catalysts, income profile — then a full rebalance recommendation.</div>',
+        unsafe_allow_html=True
+    )
+
+    scored_r = st.session_state.scored
+    api_key_r = st.session_state.get("api_key","") or os.environ.get("ANTHROPIC_API_KEY","")
+
+    if scored_r is None:
+        st.info("📂 Upload and analyse your BRVM CSV first (sidebar), then run deep research here.")
+    elif not api_key_r:
+        st.warning("🔑 Please enter your Anthropic API key in the sidebar to enable live research.")
+    else:
+        # ── RESEARCH CONTROLS ─────────────────────────────────────────────
+        st.markdown('<div class="section-title">📡 Live Market Intelligence</div>', unsafe_allow_html=True)
+
+        r_col1, r_col2, r_col3 = st.columns([0.4, 0.3, 0.3])
+
+        with r_col1:
+            research_scope = st.selectbox(
+                "Research scope",
+                ["Top 10 ranked stocks", "My portfolio holdings only",
+                 "Top 10 + portfolio holdings", "Custom selection"],
+                key="research_scope"
+            )
+
+        with r_col2:
+            if research_scope == "Custom selection" and scored_r is not None:
+                custom_tickers = st.multiselect(
+                    "Select tickers",
+                    options=sorted(scored_r['ric'].tolist()),
+                    default=scored_r.head(5)['ric'].tolist(),
+                    key="custom_tickers"
+                )
+            else:
+                custom_tickers = []
+
+        with r_col3:
+            if st.session_state.intel_last_run:
+                st.markdown(
+                    f'<div style="font-size:0.8rem;color:#8b949e;padding-top:28px">'
+                    f'Last run: {st.session_state.intel_last_run}</div>',
+                    unsafe_allow_html=True
+                )
+
+        # Determine tickers to research
+        def get_research_tickers():
+            port_tickers = []
+            if st.session_state.get("port_data_v2"):
+                port_tickers = st.session_state.port_data_v2['positions']['ric'].str.upper().tolist()
+            elif st.session_state.get("transactions"):
+                from collections import Counter
+                port_tickers = list({t['ric'].upper() for t in st.session_state.transactions
+                                     if t['type'] in ('BUY','DIV_REINVEST')})
+
+            if research_scope == "Top 10 ranked stocks":
+                return scored_r.head(10)['ric'].tolist()
+            elif research_scope == "My portfolio holdings only":
+                return port_tickers if port_tickers else scored_r.head(5)['ric'].tolist()
+            elif research_scope == "Top 10 + portfolio holdings":
+                combined = scored_r.head(10)['ric'].tolist()
+                for t in port_tickers:
+                    if t not in combined:
+                        combined.append(t)
+                return combined[:15]
+            else:
+                return custom_tickers
+
+        run_intel_col, clear_intel_col = st.columns([0.5, 0.5])
+        with run_intel_col:
+            run_research = st.button(
+                "🔎 Run Live Research",
+                use_container_width=True,
+                help="Fetches real-time data from BRVM, Sikafinance, Richbourse, AMF-UEMOA using AI web search"
+            )
+        with clear_intel_col:
+            if st.button("🗑 Clear Research Cache", use_container_width=True, key="clear_intel"):
+                st.session_state.market_intel = {}
+                st.session_state.deep_dive_cache = {}
+                st.session_state.rebalance_report = None
+                st.session_state.intel_last_run = None
+                st.rerun()
+
+        if run_research:
+            tickers_to_research = get_research_tickers()
+            if not tickers_to_research:
+                st.warning("No tickers selected.")
+            else:
+                progress_bar = st.progress(0)
+                status_text  = st.empty()
+
+                def update_progress(i, total, ric):
+                    progress_bar.progress((i + 1) / total)
+                    status_text.markdown(
+                        f'<div style="color:#8b949e;font-size:0.85rem">🔍 Researching {ric} ({i+1}/{total})…</div>',
+                        unsafe_allow_html=True
+                    )
+
+                with st.spinner(f"Running live research on {len(tickers_to_research)} tickers…"):
+                    intel = fetch_market_intelligence(
+                        tickers_to_research, api_key_r, update_progress
+                    )
+                    st.session_state.market_intel = intel
+                    st.session_state.intel_last_run = datetime.now().strftime("%d %b %Y %H:%M")
+                    # Re-score with sentiment
+                    updated_scored = recalculate_with_intel(scored_r, intel)
+                    st.session_state.scored = updated_scored
+                    st.session_state.rebalance_report = None
+                    st.session_state.deep_dive_cache = {}
+
+                progress_bar.empty()
+                status_text.empty()
+                st.success(f"✅ Research complete for {len(intel)} tickers. Rankings updated with sentiment scores.")
+                st.rerun()
+
+        # ── INTELLIGENCE DASHBOARD ────────────────────────────────────────
+        market_intel = st.session_state.market_intel
+        if market_intel:
+            st.markdown("---")
+            st.markdown('<div class="section-title">📊 Market Intelligence Summary</div>', unsafe_allow_html=True)
+
+            # Summary cards grid
+            sentiment_map = {"bullish": ("green","🟢"), "bearish": ("red","🔴"), "neutral": ("blue","⚪")}
+            volume_map    = {"increasing": "⬆️", "decreasing": "⬇️", "stable": "➡️", "unknown": "❓"}
+
+            intel_items = list(market_intel.items())
+            cols_per_row = 3
+            for row_start in range(0, len(intel_items), cols_per_row):
+                row_items = intel_items[row_start:row_start+cols_per_row]
+                cols = st.columns(len(row_items))
+                for col, (ric, intel) in zip(cols, row_items):
+                    s_color, s_icon = sentiment_map.get(intel.get("sentiment","neutral"), ("blue","⚪"))
+                    v_icon = volume_map.get(intel.get("volume_trend","unknown"), "❓")
+                    cats_pos = intel.get("catalyst_positive",[]) or []
+                    cats_neg = intel.get("catalyst_negative",[]) or []
+
+                    scored_row = scored_r[scored_r['ric']==ric]
+                    comp_str = f"{scored_row.iloc[0]['composite']:.2f}" if not scored_row.empty else "N/A"
+
+                    with col:
+                        st.markdown(f"""
+                        <div class="card card-{s_color}" style="min-height:180px">
+                          <div style="display:flex;justify-content:space-between;align-items:center">
+                            <span class="stock-ticker" style="font-size:1.1rem">{ric}</span>
+                            <span style="font-size:0.75rem;color:#8b949e">Score {comp_str}</span>
+                          </div>
+                          <div style="margin:6px 0">
+                            {color_badge(f"{s_icon} {intel.get('sentiment','N/A').upper()}", s_color)}
+                            <span style="font-size:0.8rem;color:#8b949e;margin-left:6px">{v_icon} Vol: {intel.get('volume_trend','N/A')}</span>
+                          </div>
+                          <div style="font-size:0.8rem;color:#8b949e;margin:4px 0">{intel.get('volume_comment','')[:80]}…</div>
+                          {'<div style="font-size:0.78rem;color:#2ea043;margin-top:4px">✅ ' + ' · '.join(cats_pos[:2]) + '</div>' if cats_pos else ''}
+                          {'<div style="font-size:0.78rem;color:#f85149;margin-top:2px">⚠️ ' + ' · '.join(cats_neg[:2]) + '</div>' if cats_neg else ''}
+                          <div style="font-size:0.78rem;color:#8b949e;margin-top:6px;border-top:1px solid #21262d;padding-top:4px">{intel.get('analyst_note','')[:120]}…</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # ── FULL INTELLIGENCE TABLE ───────────────────────────────────
+            with st.expander("📋 Full Intelligence Table", expanded=False):
+                rows_intel = []
+                for ric, intel in market_intel.items():
+                    srow = scored_r[scored_r['ric']==ric]
+                    rows_intel.append({
+                        "Ticker": ric,
+                        "Sentiment": intel.get("sentiment","N/A").capitalize(),
+                        "Sent. Score": f"{intel.get('sentiment_score',0.5):.2f}",
+                        "Volume": intel.get("volume_trend","N/A").capitalize(),
+                        "Pos. Catalysts": " · ".join((intel.get("catalyst_positive",[]) or [])[:2]),
+                        "Neg. Risks": " · ".join((intel.get("catalyst_negative",[]) or [])[:2]),
+                        "Div. Outlook": intel.get("dividend_comment","N/A")[:60],
+                        "Composite": f"{srow.iloc[0]['composite']:.2f}" if not srow.empty else "N/A",
+                        "Sources": ", ".join(intel.get("data_sources",[]) or [])[:40],
+                    })
+                if rows_intel:
+                    st.dataframe(pd.DataFrame(rows_intel), use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # ── PER-TICKER DEEP DIVE ──────────────────────────────────────
+            st.markdown('<div class="section-title">🔬 Per-Ticker Deep Dive Research</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="color:#8b949e;font-size:0.85rem;margin-bottom:12px">'
+                'Generate a full equity research note for any researched ticker.</div>',
+                unsafe_allow_html=True
+            )
+
+            dd_ric = st.selectbox(
+                "Select ticker for deep dive",
+                options=list(market_intel.keys()),
+                key="dd_ric_select"
+            )
+
+            if dd_ric:
+                portfolio_position = None
+                if st.session_state.get("port_data_v2"):
+                    pos_df = st.session_state.port_data_v2['positions']
+                    match = pos_df[pos_df['ric'].str.upper() == dd_ric.upper()]
+                    if not match.empty:
+                        portfolio_position = match.iloc[0].to_dict()
+
+                scored_match = scored_r[scored_r['ric'] == dd_ric]
+                scored_dict  = scored_match.iloc[0].to_dict() if not scored_match.empty else {}
+
+                dd_col1, dd_col2 = st.columns([0.5, 0.5])
+                with dd_col1:
+                    gen_dd = st.button(f"📝 Generate Deep Dive: {dd_ric}", use_container_width=True, key="gen_dd")
+                with dd_col2:
+                    if dd_ric in st.session_state.deep_dive_cache:
+                        st.markdown(
+                            f'<div style="font-size:0.8rem;color:#2ea043;padding-top:10px">✅ Report cached — regenerate to refresh</div>',
+                            unsafe_allow_html=True
+                        )
+
+                if gen_dd:
+                    with st.spinner(f"Writing equity research note for {dd_ric}…"):
+                        note = generate_deep_dive(
+                            dd_ric, scored_dict,
+                            market_intel.get(dd_ric, _default_intel(dd_ric)),
+                            portfolio_position, api_key_r
+                        )
+                        st.session_state.deep_dive_cache[dd_ric] = note
+                    st.rerun()
+
+                if dd_ric in st.session_state.deep_dive_cache:
+                    report_text = st.session_state.deep_dive_cache[dd_ric]
+                    st.markdown(f"""
+                    <div class="card card-blue">
+                      <div style="font-size:0.8rem;color:#8b949e;margin-bottom:10px">
+                        📊 Equity Research Note — {dd_ric} | Generated {datetime.now().strftime('%d %b %Y')}
+                      </div>
+                      <div style="font-size:0.92rem;line-height:1.75;color:#e6edf3;white-space:pre-wrap">{report_text}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.download_button(
+                        f"⬇ Download {dd_ric} Research Note (.txt)",
+                        data=report_text,
+                        file_name=f"BRVM_{dd_ric}_research_{datetime.now().strftime('%Y%m%d')}.txt",
+                        mime="text/plain",
+                        key=f"dl_dd_{dd_ric}"
+                    )
+
+            st.markdown("---")
+
+            # ── PORTFOLIO REBALANCE REPORT ────────────────────────────────
+            st.markdown('<div class="section-title">⚖️ Portfolio Rebalance Report</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="color:#8b949e;font-size:0.85rem;margin-bottom:12px">'
+                'Integrates your holdings, live sentiment, catalysts, and model rankings into a single rebalance plan.</div>',
+                unsafe_allow_html=True
+            )
+
+            rb_col1, rb_col2 = st.columns([0.5, 0.5])
+            with rb_col1:
+                gen_rebalance = st.button("⚖️ Generate Rebalance Report", use_container_width=True, key="gen_rebalance")
+            with rb_col2:
+                if st.session_state.rebalance_report:
+                    st.markdown('<div style="font-size:0.8rem;color:#2ea043;padding-top:10px">✅ Report ready — regenerate to refresh</div>', unsafe_allow_html=True)
+
+            if gen_rebalance:
+                port_data = st.session_state.get("port_data_v2")
+                if port_data is None and st.session_state.get("transactions"):
+                    raw_df = st.session_state.get("raw_df")
+                    if raw_df is not None:
+                        with st.spinner("Computing portfolio…"):
+                            port_data = compute_portfolio_v2(
+                                st.session_state.transactions, raw_df,
+                                st.session_state.scored
+                            )
+                        st.session_state.port_data_v2 = port_data
+
+                with st.spinner("Generating rebalance report…"):
+                    report = generate_rebalance_report(
+                        st.session_state.scored or scored_r,
+                        port_data, market_intel, api_key_r
+                    )
+                    st.session_state.rebalance_report = report
+                st.rerun()
+
+            if st.session_state.rebalance_report:
+                st.markdown(f"""
+                <div class="card card-gold">
+                  <div style="font-size:0.8rem;color:#8b949e;margin-bottom:10px">
+                    ⚖️ Portfolio Rebalance Report | Generated {datetime.now().strftime('%d %b %Y, %H:%M')}
+                  </div>
+                  <div style="font-size:0.93rem;line-height:1.75;color:#e6edf3;white-space:pre-wrap">{st.session_state.rebalance_report}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.download_button(
+                    "⬇ Download Rebalance Report (.txt)",
+                    data=st.session_state.rebalance_report,
+                    file_name=f"BRVM_rebalance_{datetime.now().strftime('%Y%m%d')}.txt",
+                    mime="text/plain",
+                    key="dl_rebalance"
+                )
+
+        else:
+            # No intel yet — show dividend income profile as static fallback
+            st.markdown("---")
+            st.markdown('<div class="section-title">📅 3-Year Dividend Income Profile (Offline Data)</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="color:#8b949e;font-size:0.85rem;margin-bottom:12px">'
+                'Run live research above to enrich with real-time data. '
+                'Showing static 3-year dividend profile in the meantime.</div>',
+                unsafe_allow_html=True
+            )
+
+            div_rows = []
+            for ric, d in DIVIDEND_HISTORY_3Y.items():
+                div_rows.append({
+                    "Ticker": ric,
+                    "2022 (XOF)": d.get("2022","—"),
+                    "2023 (XOF)": d.get("2023","—"),
+                    "2024 (XOF)": d.get("2024","—"),
+                    "3Y Growth": d.get("growth","N/A"),
+                    "Avg Yield": d.get("yield_3y_avg","N/A"),
+                    "Consistent?": "✅ Yes" if d.get("payout_consistent") else "⚠️ Irregular",
+                })
+            st.dataframe(pd.DataFrame(div_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("""
+            <div class="card card-blue" style="text-align:center;padding:30px;margin-top:20px">
+              <div style="font-size:1.5rem">🔎</div>
+              <div style="font-size:1rem;font-weight:700;margin:10px 0">Run Live Research to unlock full intelligence</div>
+              <div style="color:#8b949e;font-size:0.88rem">
+                Click <strong>Run Live Research</strong> above to fetch real-time sentiment, catalysts,
+                analyst notes, and volume trends from BRVM.org, Sikafinance, Richbourse, and AMF-UEMOA.<br><br>
+                Research updates the composite scores with live sentiment (+15% weight) and enables
+                per-ticker deep dives and portfolio rebalance reports.
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
